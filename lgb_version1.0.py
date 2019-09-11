@@ -114,17 +114,29 @@ with multiprocessing.Pool() as pool:
 
 gc.collect()
 
-with open('./data/train_transaction.pkl', 'wb') as f:
-    pickle.dump(train_df, f)
-with open('./data/test_transaction.pkl', 'wb') as f:
-    pickle.dump(test_df, f)
-with open('./data/train_identity.pkl', 'wb') as f:
-    pickle.dump(train_id, f)
-with open('./data/test_identity.pkl', 'wb') as f:
-    pickle.dump(test_id, f)with open('./data/train.pkl', 'rb') as f:
-    train = pickle.load(f)
-with open('./data/test.pkl', 'rb') as f:
-    test = pickle.load(f)
+
+# In[ ]:
+
+
+# with open('./data/train_transaction.pkl', 'wb') as f:
+#     pickle.dump(train_df, f)
+# with open('./data/test_transaction.pkl', 'wb') as f:
+#     pickle.dump(test_df, f)
+# with open('./data/train_identity.pkl', 'wb') as f:
+#     pickle.dump(train_id, f)
+# with open('./data/test_identity.pkl', 'wb') as f:
+#     pickle.dump(test_id, f)
+
+
+# In[ ]:
+
+
+# with open('./data/train.pkl', 'rb') as f:
+#     train = pickle.load(f)
+# with open('./data/test.pkl', 'rb') as f:
+#     test = pickle.load(f)
+
+
 # In[9]:
 
 
@@ -647,7 +659,7 @@ for col in cate_cols:
 
 gc.collect()
 
-train_values, test_values = df[:][:train_num], df[:][train_num:]
+
 # In[55]:
 
 
