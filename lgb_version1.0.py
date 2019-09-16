@@ -683,7 +683,7 @@ param = {
     'num_iterations': 400,
     'learning_rate': 0.1,
     'num_leaves': 2**8,
-    'num_threads': 4,
+    'num_threads': 87,
     'seed': 2019,
     'max_depth': -1,
     'min_data_in_leaf': 5,
@@ -747,20 +747,10 @@ print('oof auc: ', roc_auc_score(labels, oof_pred_prob))
 test_pred_prob.size
 
 
-# In[58]:
-
-
-sub = pd.read_csv('./sub/sub_2019-09-10 01-57-18.csv')
-
-
 # In[59]:
 
 
-sub['isFraud'] = 1-sub['isFraud']
 sub.to_csv(f"./sub/sub_{datetime.datetime.now().strftime('%Y-%m-%d %H-%M-%S')}.csv", index=False)
-
-
-# In[ ]:
 
 
 
