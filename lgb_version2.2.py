@@ -24,15 +24,15 @@ from sklearn.model_selection import StratifiedKFold, GroupKFold
 from sklearn.metrics import roc_auc_score, log_loss, roc_curve
 from scipy import sparse
 from scipy.stats import kurtosis
-import cufflinks as cf
-from IPython.display import display,HTML
-from plotly.offline import init_notebook_mode
-cf.go_offline()
-get_ipython().run_line_magic('reload_ext', 'autoreload')
-get_ipython().run_line_magic('autoreload', '2')
-get_ipython().run_line_magic('matplotlib', 'inline')
-cf.set_config_file(theme='ggplot',sharing='public',offline=True)
-init_notebook_mode(connected=False)  
+#import cufflinks as cf
+#from IPython.display import display,HTML
+#from plotly.offline import init_notebook_mode
+#cf.go_offline()
+#%reload_ext autoreload
+#%autoreload 2
+#%matplotlib inline
+#cf.set_config_file(theme='ggplot',sharing='public',offline=True)
+#init_notebook_mode(connected=False)  
 # warnings.filterwarnings('ignore')
 
 pd.set_option('display.max_columns', None)
@@ -85,6 +85,15 @@ def load_data(file):
         return pd.read_pickle(file)
     else:
         raise IOError("Error: unknown file type: "+file)
+
+
+# In[ ]:
+
+
+def seed_everything(seed=0):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
 
 
 # In[4]:
@@ -202,7 +211,7 @@ def values_normalization(dt_df, periods, columns):
 # In[7]:
 
 
-def make_predictions(train_df, test_df, feature_cols, target, param, NFOLDS=2):
+def make_predictions_gkf(train_df, test_df, feature_cols, target, param, NFOLDS=2):
     gkf = GroupKFold(n_splits=NFOLDS)
     split_groups = train_df['DT_M']
     
@@ -215,6 +224,50 @@ def make_predictions(train_df, test_df, feature_cols, target, param, NFOLDS=2):
     split_groups = train_df['DT_M']
     
     for i, (train_idx, valid_idx) in enumerate (gkf.split(train_values, labels, groups = split_groups)):
+        print(i,'fold...')
+        start_time = time.time()
+    
+        train_x, train_y = train_values.iloc[train_idx], labels[train_idx]
+        valid_x, valid_y = train_values.iloc[valid_idx], labels[valid_idx]
+    
+        # Construct the dataset
+        train_data = lgb.Dataset(train_x, label=train_y, categorical_feature=cate_cols, free_raw_data = True)
+        valid_data = lgb.Dataset(valid_x, label=valid_y, categorical_feature=cate_cols, reference = train_data, free_raw_data = True)
+    
+        # Training
+        bst = lgb.train(param, train_data, valid_sets=[train_data, valid_data],verbose_eval=200)
+        
+        # Prediction
+        valid_pred_prob = bst.predict(valid_x, num_iteration=bst.best_iteration)
+        oof_pred_prob[valid_idx] =  valid_pred_prob
+        print('val logloss: ', log_loss(valid_y, valid_pred_prob))
+        print('val auc: ', roc_auc_score(valid_y, valid_pred_prob))
+        
+        test_pred_prob += bst.predict(test_values, num_iteration=bst.best_iteration)/gkf.n_splits
+         
+        print('runtime: {}\n'.format(time.time() - start_time))
+    
+        # Plotting
+        lgb.plot_importance(bst,max_num_features=30)
+    
+    print('oof logloss: ', log_loss(labels, oof_pred_prob))
+    print('oof auc: ', roc_auc_score(labels, oof_pred_prob))
+    
+    test_df['isFraud'] = test_pred_prob
+    return test_df[['TransactionID','isFraud']]
+
+def make_predictions_kf(train_df, test_df, feature_cols, target, param, NFOLDS=2):
+    kf = KFold(n_splits=NFOLDS, shuffle=True, random_state=SEED)
+    split_groups = train_df['DT_M']
+    
+    test_pred_prob = np.zeros(test_num)
+    oof_pred_prob = np.zeros(train_num)
+    
+    train_values = train_df[feature_cols]
+    test_values = test_df[feature_cols]
+    labels = train_df['isFraud']
+    
+    for i, (train_idx, valid_idx) in enumerate (kf.split(train_values, labels)):
         print(i,'fold...')
         start_time = time.time()
     
@@ -307,25 +360,19 @@ train_df.head()
 # In[13]:
 
 
+SEED = 42
+seed_everything(SEED)
+TARGET = 'isFraud'
+START_DATE = datetime.datetime.strptime('2017-11-30', '%Y-%m-%d')
+KS_TEST = False
+
 train_base_cols = list(train_df)
 test_base_cols = list(test_df)
 
-
-# In[14]:
-
-
-labels = train_df['isFraud']
-
-
-# In[15]:
-
+labels = train_df[TARGET]
 
 train_num = train_df.shape[0]
 test_num = test_df.shape[0]
-
-
-# In[16]:
-
 
 train_df['TransactionAmt'] = train_df['TransactionAmt'].astype(float)
 test_df['TransactionAmt'] = test_df['TransactionAmt'].astype(float)
@@ -365,8 +412,8 @@ test_df['TransactionAmt_log1p'] = np.log1p(test_df['TransactionAmt'])
 # In[20]:
 
 
-train_df['DT'] = train_df['TransactionDT'].apply(lambda s:(datetime.datetime.strptime('2017-11-30', '%Y-%m-%d') + datetime.timedelta(seconds = s)))
-test_df['DT'] = test_df['TransactionDT'].apply(lambda s:(datetime.datetime.strptime('2017-11-30', '%Y-%m-%d') + datetime.timedelta(seconds = s)))
+train_df['DT'] = train_df['TransactionDT'].apply(lambda s:(START_DATE + datetime.timedelta(seconds = s)))
+test_df['DT'] = test_df['TransactionDT'].apply(lambda s:(START_DATE + datetime.timedelta(seconds = s)))
 
 
 # In[21]:
@@ -393,7 +440,7 @@ for df in [train_df, test_df]:
 
 
 # Statistical features by time periods
-cate_cols = ['DT_M', 'DT_W', 'DT_D', 'DT_H']
+cate_cols = ['DT_M', 'DT_W', 'DT_D']
 agg_types = ['mean', 'median', 'std', 'count']
 
 # count, diff, norm
@@ -405,9 +452,11 @@ train_df, test_df = aggregation(train_df, test_df, ['TransactionAmt'], cate_cols
 
 for df in [train_df, test_df]:
     # 当小时账单数在当日账单数的占比
-    df[ 'H/D_TransactionAmt_cnt'] = df['DT_H_TransactionAmt_count'] / df['DT_D_TransactionAmt_count']
+    # df[ 'H/D_TransactionAmt_cnt'] = df['DT_H_TransactionAmt_count'] / df['DT_D_TransactionAmt_count']
     # 当日账单数在当周账单数的占比
     df[ 'D/W_TransactionAmt_cnt'] = df['DT_D_TransactionAmt_count'] / df['DT_W_TransactionAmt_count']
+    # 当周账单数在当月账单数的占比
+    df[ 'W/M_TransactionAmt_cnt'] = df['DT_W_TransactionAmt_count'] / df['DT_M_TransactionAmt_count']
 
 
 # In[27]:
@@ -932,28 +981,26 @@ gc.collect()
 
 
 ## ks test
-feature_cols = set(feature_cols).difference(train_base_cols+rm_cols)
-list_p_value =[]
+if KS_TEST:
+    feature_cols = set(feature_cols).difference(train_base_cols+rm_cols)
+    list_p_value =[]
 
-for i in tqdm(feature_cols):
-    list_p_value.append(ks_2samp(test_df[i] , train_df[i])[1])
+    for i in tqdm(feature_cols):
+        list_p_value.append(ks_2samp(test_df[i] , train_df[i])[1])
 
-Se = pd.Series(list_p_value, index = feature_cols).sort_values() 
-list_discarded = list(Se[Se==0].index)
+    Se = pd.Series(list_p_value, index = feature_cols).sort_values() 
+    list_discarded = list(Se[Se==0].index)
 
-print(list_discarded)
+    print(list_discarded)
 
-
-# In[70]:
-
-
-feature_cols = [col for col in train_df.keys() if col not in rm_cols + list_discarded]
+    feature_cols = [col for col in train_df.keys() if col not in rm_cols + list_discarded]
+    cate_cols = [col for col in cate_cols if col not in rm_cols + list_discarded]
 
 
-# In[68]:
+# In[71]:
 
 
-train_df.shape, test_df.shape
+print(train_df.shape, test_df.shape)
 
 
 # In[66]:
@@ -972,7 +1019,7 @@ lgb_param = {
     'min_sum_hessain_in_leaf': 4,
     'bagging_fraction': 0.7,
     'bagging_freq': 1,
-    'feature_fraction': 0.5,
+    'feature_fraction': 0.7,
     'lambda_l1': 3,
     'lambda_l2': 5,
     'min_gain_to_split': 0,
@@ -980,7 +1027,8 @@ lgb_param = {
     'metric': 'auc'
 }
 
-test_predictions = make_predictions(train_df, test_df, feature_cols, labels, lgb_param, NFOLD=6)
+# test_predictions = make_predictions_gkf(train_df, test_df, feature_cols, labels, lgb_param, NFOLDS=6)
+test_predictions = make_predictions_kf(train_df, test_df, feature_cols, labels, lgb_param, NFOLDS=10)
 
 
 # In[65]:
