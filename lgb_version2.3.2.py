@@ -372,16 +372,16 @@ if LOCAL_TEST:
         else:
             print ("Loading done")
         
-        train_df['DT_M'] = train_df['TransactionDT'].apply(lambda x: (START_DATE + datetime.timedelta(seconds = x)))
-        train_df['DT_M'] = (train_df['DT_M'].dt.year-2017)*12 + train_df['DT_M'].dt.month 
-        test_df = train_df[train_df['DT_M']==train_df['DT_M'].max()].reset_index(drop=True)
-        # 只选择1,2,3月，因为12月太特殊，删除试试
-        train_df = train_df[(train_df['DT_M'].min()<train_df['DT_M']) & (train_df['DT_M']<(train_df['DT_M'].max()))].reset_index(drop=True)
+    train_df['DT_M'] = train_df['TransactionDT'].apply(lambda x: (START_DATE + datetime.timedelta(seconds = x)))
+    train_df['DT_M'] = (train_df['DT_M'].dt.year-2017)*12 + train_df['DT_M'].dt.month 
+    test_df = train_df[train_df['DT_M']==train_df['DT_M'].max()].reset_index(drop=True)
+    # 只选择1,2,3月，因为12月太特殊，删除试试
+    train_df = train_df[(train_df['DT_M'].min()<train_df['DT_M']) & (train_df['DT_M']<(train_df['DT_M'].max()))].reset_index(drop=True)
         
-        test_id  = train_id[train_id['TransactionID'].isin(test_df['TransactionID'])].reset_index(drop=True)
-        train_id = train_id[train_id['TransactionID'].isin(train_df['TransactionID'])].reset_index(drop=True)
+    test_id  = train_id[train_id['TransactionID'].isin(test_df['TransactionID'])].reset_index(drop=True)
+    train_id = train_id[train_id['TransactionID'].isin(train_df['TransactionID'])].reset_index(drop=True)
         
-        del train_df['DT_M'], test_df['DT_M']
+    del train_df['DT_M'], test_df['DT_M']
     
     
 else:    
@@ -398,27 +398,35 @@ else:
             print (er)
         else:
             print ("Loading done")
+        
+    train_df['DT_M'] = train_df['TransactionDT'].apply(lambda x: (START_DATE + datetime.timedelta(seconds = x)))
+    train_df['DT_M'] = (train_df['DT_M'].dt.year-2017)*12 + train_df['DT_M'].dt.month 
+    
+    train_df = train_df[(train_df['DT_M'].min()<train_df['DT_M'])].reset_index(drop=True)
+    train_id = train_id[train_id['TransactionID'].isin(train_df['TransactionID'])].reset_index(drop=True)
+    
+    del train_df['DT_M']
 
 
-# In[ ]:
+# In[12]:
 
 
 gc.collect()
 
 
-# In[ ]:
+# In[13]:
 
 
 print('Shape control: ', train_df.shape, test_df.shape, train_id.shape, test_id.shape)
 
 
-# In[ ]:
+# In[14]:
 
 
 train_df.head()
 
 
-# In[ ]:
+# In[15]:
 
 
 train_base_cols = list(train_df)
@@ -435,7 +443,7 @@ test_df['TransactionAmt'] = test_df['TransactionAmt'].astype(float)
 
 # ## . Check if the TransactionAmt is common or not
 
-# In[ ]:
+# In[16]:
 
 
 train_df['TransactionAmt_check'] = np.where(train_df['TransactionAmt'].isin(test_df['TransactionAmt']), 1, 0)
@@ -444,7 +452,7 @@ test_df['TransactionAmt_check']  = np.where(test_df['TransactionAmt'].isin(train
 
 # ## . log1p transformation of 'TransactionAmt'
 
-# In[ ]:
+# In[17]:
 
 
 train_df['TransactionAmt_log1p'] = np.log1p(train_df['TransactionAmt'])
@@ -453,14 +461,14 @@ test_df['TransactionAmt_log1p'] = np.log1p(test_df['TransactionAmt'])
 
 # # TransactionDT
 
-# In[ ]:
+# In[18]:
 
 
 train_df['DT'] = train_df['TransactionDT'].apply(lambda s:(START_DATE + datetime.timedelta(seconds = s)))
 test_df['DT'] = test_df['TransactionDT'].apply(lambda s:(START_DATE + datetime.timedelta(seconds = s)))
 
 
-# In[ ]:
+# In[19]:
 
 
 for df in [train_df, test_df]:
@@ -479,19 +487,19 @@ for df in [train_df, test_df]:
     df['D9'] = np.where(df['D9'].isna(),0,1)
 
 
-# In[ ]:
+# In[20]:
 
 
 train_df['month'].unique()
 
 
-# In[ ]:
+# In[21]:
 
 
 test_df['month'].unique()
 
 
-# In[ ]:
+# In[22]:
 
 
 train_df.head()
@@ -499,7 +507,7 @@ train_df.head()
 
 # ## . count of M1-M9
 
-# In[ ]:
+# In[23]:
 
 
 i_cols = ['M1','M2','M3','M5','M6','M7','M8','M9']
