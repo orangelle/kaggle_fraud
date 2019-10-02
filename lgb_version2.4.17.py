@@ -1,0 +1,1326 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[1]:
+
+
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+import lightgbm as lgb
+import time
+import datetime
+import warnings
+import gc
+import os
+import pickle
+import multiprocessing
+import itertools
+import random
+from tqdm import tqdm
+from scipy.stats import ks_2samp
+from scipy import sparse
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import StratifiedKFold, GroupKFold, KFold
+from sklearn.metrics import roc_auc_score, log_loss, roc_curve
+from scipy.stats import kurtosis
+from sklearn.decomposition import PCA
+from sklearn.feature_extraction.text import TfidfTransformer, CountVectorizer
+#import cufflinks as cf
+#from IPython.display import display,HTML
+#from plotly.offline import init_notebook_mode
+#cf.go_offline()
+#%reload_ext autoreload
+#%autoreload 2
+#%matplotlib inline
+#cf.set_config_file(theme='ggplot',sharing='public',offline=True)
+#init_notebook_mode(connected=False)  
+warnings.filterwarnings('ignore')
+
+pd.set_option('display.max_columns', None)
+pd.set_option('display.max_rows', 100)
+
+# np.set_printoptions(suppress=True)
+# pd.set_option('precision', 5)
+# pd.set_option('display.float_format', lambda x: '%.5f' % x) #为了直观的显示数字，不采用科学计数法
+
+
+# In[2]:
+
+
+def reduce_mem_usage(df, verbose=True):
+    numerics = ['int16', 'int32', 'int64', 'float16', 'float32', 'float64']
+    start_mem = df.memory_usage().sum() / 1024**2    
+    for col in df.columns:
+        col_type = df[col].dtypes
+        if col_type in numerics:
+            c_min = df[col].min()
+            c_max = df[col].max()
+            if str(col_type)[:3] == 'int':
+                if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
+                    df[col] = df[col].astype(np.int8)
+                elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
+                    df[col] = df[col].astype(np.int16)
+                elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
+                    df[col] = df[col].astype(np.int32)
+                elif c_min > np.iinfo(np.int64).min and c_max < np.iinfo(np.int64).max:
+                    df[col] = df[col].astype(np.int64)
+            else:
+                if c_min > np.finfo(np.float16).min and c_max < np.finfo(np.float16).max:
+                    df[col] = df[col].astype(np.float16)
+                elif c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
+                    df[col] = df[col].astype(np.float32)
+                else:
+                    df[col] = df[col].astype(np.float64)
+    end_mem = df.memory_usage().sum() / 1024**2
+    if verbose: print('Mem. usage decreased to {:5.2f} Mb ({:.1f}% reduction)'.format(end_mem, 100 * (start_mem - end_mem) / start_mem))
+    return df
+
+
+# In[3]:
+
+
+def load_data(file):
+    if (file.split('.'))[-1] == 'csv':
+        return reduce_mem_usage(pd.read_csv(file))
+    elif (file.split('.'))[-1] == 'pkl':
+        return pd.read_pickle(file)
+    else:
+        raise IOError("Error: unknown file type: "+file)
+
+
+# In[4]:
+
+
+def seed_everything(seed=0):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+
+
+# In[5]:
+
+
+def relax_data(df_train, df_test, col):
+    cv1 = pd.DataFrame(df_train[col].value_counts().reset_index().rename({col:'train'},axis=1))
+    cv2 = pd.DataFrame(df_test[col].value_counts().reset_index().rename({col:'test'},axis=1))
+    cv3 = pd.merge(cv1,cv2,on='index',how='outer')
+    factor = len(df_test)/len(df_train)
+    cv3['train'].fillna(0,inplace=True)
+    cv3['test'].fillna(0,inplace=True)
+    cv3['remove'] = False
+    cv3['remove'] = cv3['remove'] | (cv3['train'] < len(df_train)/10000)
+    cv3['remove'] = cv3['remove'] | (factor*cv3['train'] < cv3['test']/3)
+    cv3['remove'] = cv3['remove'] | (factor*cv3['train'] > 3*cv3['test'])
+    cv3['new'] = cv3.apply(lambda x: x['index'] if x['remove']==False else 0,axis=1)
+    cv3['new'],_ = cv3['new'].factorize(sort=True)
+    cv3.set_index('index',inplace=True)
+    cc = cv3['new'].to_dict()
+    df_train[col] = df_train[col].map(cc)
+    df_test[col] = df_test[col].map(cc)
+    return df_train, df_test
+
+
+# In[6]:
+
+
+def aggregation(train_df, test_df, main_cols, cate_cols, agg_types, with_diff=False, with_norm=False):
+    for main_col in main_cols:
+        for cate_col in cate_cols:
+            new_col_names = [cate_col+'_'+main_col+'_'+agg_type for agg_type in agg_types]
+            temp_group = pd.concat([train_df[[cate_col, main_col]], test_df[[cate_col, main_col]]]).groupby([cate_col])
+            temp_df = temp_group[main_col].agg(dict(zip(new_col_names, agg_types)))
+            
+            for new_col_name in new_col_names:
+                train_df[new_col_name] = train_df[cate_col].map(temp_df[new_col_name])
+                test_df[new_col_name] = test_df[cate_col].map(temp_df[new_col_name])
+            
+            
+            if with_diff:
+                temp_col_names = []
+                nec_aggs = ['median', 'mean']
+                
+                for agg_type in nec_aggs:
+                    if agg_type not in agg_types:
+                        temp_col_name = cate_col+'_'+main_col+'_'+agg_type
+                        temp_df = temp_group[main_col].agg({temp_col_name : agg_type})
+                        
+                        for df in [train_df, test_df]:
+                            df[temp_col_name] = df[cate_col].map(temp_df[temp_col_name])
+                    
+                        temp_col_names.append(temp_col_name)
+                
+                for df in [train_df, test_df]:
+                    df[cate_col+'_'+main_col+'_diff_median'] = df[main_col] - df[cate_col+'_'+main_col+'_median']
+                    df[cate_col+'_'+main_col+'_diff_mean'] = df[main_col] - df[cate_col+'_'+main_col+'_mean']
+                    
+                for temp_col_name in temp_col_names:
+                    for df in [train_df, test_df]:
+                        del df[temp_col_name]
+
+            
+            if with_norm:
+                temp_col_names = []
+                nec_aggs = ['min', 'max', 'mean', 'std']
+                
+                for agg_type in nec_aggs:
+                    if agg_type not in agg_types:
+                        temp_col_name = cate_col+'_'+main_col+'_'+agg_type
+                        temp_df = temp_group[main_col].agg({temp_col_name : agg_type})
+                    
+                        for df in [train_df, test_df]:
+                            df[temp_col_name] = df[cate_col].map(temp_df[temp_col_name])
+                    
+                        temp_col_names.append(temp_col_name)
+                    
+                for df in [train_df, test_df]:
+                    df[cate_col+'_'+main_col+'_norm'] = (df[main_col] - df[cate_col+'_'+main_col+'_min'])/(df[cate_col+'_'+main_col+'_max'] - df[cate_col+'_'+main_col+'_min'])
+                    df[cate_col+'_'+main_col+'_zscore'] = (df[main_col] - df[cate_col+'_'+main_col+'_mean'])/df[cate_col+'_'+main_col+'_std']
+                
+                for temp_col_name in temp_col_names:
+                    for df in [train_df, test_df]:
+                        del df[temp_col_name]
+            
+    return train_df, test_df
+
+
+# In[7]:
+
+
+def values_normalization(dt_df, periods, columns):
+    for period in periods:
+        for col in columns:
+            new_col = period +'_'+ col
+            dt_df[col] = dt_df[col].astype(float)  
+
+            temp_min = dt_df.groupby([period])[col].agg(['min']).reset_index()
+            temp_min.index = temp_min[period].values
+            temp_min = temp_min['min'].to_dict()
+
+            temp_max = dt_df.groupby([period])[col].agg(['max']).reset_index()
+            temp_max.index = temp_max[period].values
+            temp_max = temp_max['max'].to_dict()
+
+            dt_df['temp_min'] = dt_df[period].map(temp_min)
+            dt_df['temp_max'] = dt_df[period].map(temp_max)
+
+            dt_df[new_col+'_norm'] = (dt_df[col]-dt_df['temp_min'])/(dt_df['temp_max']-dt_df['temp_min'])
+
+            del dt_df['temp_min'],dt_df['temp_max']
+    return dt_df
+
+
+# In[8]:
+
+
+def tfidf_encoding(train_df, test_df, target_col, refer_col):
+    
+    df = pd.concat([train_df, test_df],axis=0)
+    lists = df.groupby(refer_col)[target_col].apply(lambda s:' '.join(s.to_list()))
+    
+    vectorizer = CountVectorizer()
+    transformer = TfidfTransformer()
+    X = transformer.fit_transform(vectorizer.fit_transform(lists))
+    tfidf_df = pd.DataFrame(X.toarray(), index = lists.index, columns = vectorizer.get_feature_names())
+    
+    train_df[target_col+'_tfidf'] = train_df[[refer_col,target_col]].apply(lambda s: tfidf_df[s[target_col]][s[refer_col]],axis=1)
+    test_df[target_col+'_tfidf'] = test_df[[refer_col,target_col]].apply(lambda s: tfidf_df[s[target_col]][s[refer_col]],axis=1)
+    
+    return train_df, test_df
+
+
+# In[9]:
+
+
+def add_orig_ind_cols(dfs):
+    '''
+    Add tracker column for original df orders
+    '''
+    for df in dfs:
+        df['orig_ind'] = df.index.values
+
+def restore_orig_orders(dfs):
+    '''
+    Restore original df orders, assumes an 'orig_ind' column
+    '''       
+    for df in dfs:
+        df.sort_values(by='orig_ind', inplace=True)
+        df.drop(['orig_ind'], axis=1, inplace=True)
+        
+def add_grouped_time_delta_features(train_df, test_df, time_col, target_col, group_cols, shifts):    
+    '''
+    For epoch time, compute deltas with the specified shift on sequences
+    aggregated by group_cols, return df with new columns
+    '''
+    for df in [train_df, test_df]:
+        # sort by time
+        df.sort_values(by=time_col, inplace = True)
+    
+        for shift in shifts:
+            feat_name = '_'.join(group_cols) + ('_delta_shift_%d' % shift) 
+        
+            df[feat_name] = df.groupby(group_cols)[target_col].shift(shift) - df[target_col]
+            df[feat_name] = df[feat_name] * -1 * np.sign(shift) # flip sign for lags
+            df[feat_name] = df[feat_name].fillna(-1)
+        
+    return train_df, test_df
+
+
+# In[10]:
+
+
+def make_predictions_gkf(train_df, test_df, feature_cols, target, param, NFOLDS=2):
+    gkf = GroupKFold(n_splits=NFOLDS)
+    split_groups = train_df['DT_M']
+    
+    test_pred_prob = np.zeros(test_num)
+    oof_pred_prob = np.zeros(train_num)
+    
+    train_values = train_df[feature_cols]
+    test_values = test_df[feature_cols]
+    labels = train_df['isFraud']
+    split_groups = train_df['DT_M']
+    
+    for i, (train_idx, valid_idx) in enumerate (gkf.split(train_values, labels, groups = split_groups)):
+        print(i,'fold...')
+        start_time = time.time()
+    
+        train_x, train_y = train_values.iloc[train_idx], labels[train_idx]
+        valid_x, valid_y = train_values.iloc[valid_idx], labels[valid_idx]
+    
+        # Construct the dataset
+        train_data = lgb.Dataset(train_x, label=train_y, free_raw_data = True)
+        valid_data = lgb.Dataset(valid_x, label=valid_y, reference = train_data, free_raw_data = True)
+    
+        # Training
+        bst = lgb.train(param, train_data, valid_sets=[train_data, valid_data],verbose_eval=200)
+        
+        # Prediction
+        valid_pred_prob = bst.predict(valid_x, num_iteration=bst.best_iteration)
+        oof_pred_prob[valid_idx] = valid_pred_prob
+        print('val logloss: ', log_loss(valid_y, valid_pred_prob))
+        print('val auc: ', roc_auc_score(valid_y, valid_pred_prob))
+        
+        test_pred_prob += bst.predict(test_values, num_iteration=bst.best_iteration)/gkf.n_splits
+         
+        print('runtime: {}\n'.format(time.time() - start_time))
+    
+        # Plotting
+        lgb.plot_importance(bst,max_num_features=30)
+    
+    print('oof logloss: ', log_loss(labels, oof_pred_prob))
+    print('oof auc: ', roc_auc_score(labels, oof_pred_prob))
+    
+    test_df['isFraud'] = test_pred_prob
+    return test_df[['TransactionID','isFraud']]
+
+
+# In[11]:
+
+
+def make_predictions_kf(train_df, test_df, feature_cols,cate_cols, target, param, NFOLDS=2):
+    kf = KFold(n_splits=NFOLDS, shuffle=True, random_state=SEED)
+    split_groups = train_df['DT_M']
+    
+    test_pred_prob = np.zeros(test_num)
+    oof_pred_prob = np.zeros(train_num)
+    
+    train_values = train_df[feature_cols]
+    test_values = test_df[feature_cols]
+    labels = train_df['isFraud']
+    
+    feature_imp = pd.DataFrame()
+    feature_imp['feature'] = train_values.columns
+    
+    if LOCAL_TEST:
+        test_labels = test_df['isFraud']
+    
+    
+    for i, (train_idx, valid_idx) in enumerate (kf.split(train_values, labels)):
+        print(i,'fold...')
+        start_time = time.time()
+    
+        train_x, train_y = train_values.iloc[train_idx], labels[train_idx]
+        valid_x, valid_y = train_values.iloc[valid_idx], labels[valid_idx]
+        
+        if LOCAL_TEST:
+            # Construct the dataset
+            train_data = lgb.Dataset(train_x, label=train_y, free_raw_data = True)
+            valid_data = lgb.Dataset(valid_x, label=valid_y, reference = train_data, free_raw_data = True)
+            test_data = lgb.Dataset(test_values, label=test_labels, reference = train_data, free_raw_data = True)
+            
+            # Training
+            bst = lgb.train(param, train_data, valid_sets=[train_data, valid_data, test_data],verbose_eval=200)
+            
+            # Prediction
+            valid_pred_prob = bst.predict(valid_x, num_iteration=bst.best_iteration)
+            oof_pred_prob[valid_idx] =  valid_pred_prob
+            # print('val logloss: ', log_loss(valid_y, valid_pred_prob))
+            print('val auc: ', roc_auc_score(valid_y, valid_pred_prob))
+            
+            cur_test_pred_prob = bst.predict(test_values, num_iteration=bst.best_iteration)
+            # print('val logloss: ', log_loss(test_labels, cur_test_pred_prob))
+            print('current test auc: ', roc_auc_score(test_labels, cur_test_pred_prob))
+            
+            test_pred_prob += cur_test_pred_prob/kf.n_splits
+            
+            feature_imp['fold_{}'.format(i)] = bst.feature_importance()
+            
+        else:   
+            # Construct the dataset
+            train_data = lgb.Dataset(train_x, label=train_y, free_raw_data = True)
+            valid_data = lgb.Dataset(valid_x, label=valid_y, reference = train_data, free_raw_data = True)
+    
+            # Training
+            bst = lgb.train(param, train_data, valid_sets=[train_data, valid_data],verbose_eval=200)
+        
+            # Prediction
+            valid_pred_prob = bst.predict(valid_x, num_iteration=bst.best_iteration)
+            oof_pred_prob[valid_idx] =  valid_pred_prob
+            # print('val logloss: ', log_loss(valid_y, valid_pred_prob))
+            print('val auc: ', roc_auc_score(valid_y, valid_pred_prob))
+            
+            test_pred_prob += bst.predict(test_values, num_iteration=bst.best_iteration)/kf.n_splits
+         
+        print('runtime: {}\n'.format(time.time() - start_time))
+    
+        # Plotting
+        # lgb.plot_importance(bst,max_num_features=30)
+    
+    # print('oof logloss: ', log_loss(labels, oof_pred_prob))
+    print('oof auc: ', roc_auc_score(labels, oof_pred_prob))
+    
+    if LOCAL_TEST:
+        print('test auc: ', roc_auc_score(test_labels, test_pred_prob))
+        
+        feature_imp['average'] = feature_imp[['fold_{}'.format(fold) for fold in range(kf.n_splits)]].mean(axis=1)
+        feature_imp.to_csv('feature_importances.csv')
+
+        plt.figure(figsize=(16, 16))
+        sns.barplot(data=feature_imp.sort_values(by='average', ascending=False).head(50), x='average', y='feature');
+        plt.title('50 TOP feature importance over {} folds average'.format(kf.n_splits));
+        
+        test_df['pred_isFraud'] = test_pred_prob
+        return test_df[['TransactionID','pred_isFraud']], oof_pred_prob
+    
+    else:
+        test_df['isFraud'] = test_pred_prob
+        return test_df[['TransactionID','isFraud']] , oof_pred_prob
+
+
+# # Global variables
+
+# In[12]:
+
+
+SEED = 42
+seed_everything(SEED)
+TARGET = 'isFraud'
+START_DATE = datetime.datetime.strptime('2017-11-30', '%Y-%m-%d')
+KS_TEST = False
+LOCAL_TEST = True
+NEG_SAMPLE = False
+
+
+# # Load data
+
+# In[13]:
+
+
+if LOCAL_TEST:
+    files=['data/train_transaction.pkl',
+           'data/train_identity.pkl']
+    
+    with multiprocessing.Pool() as pool:
+        print("Loading...")
+        try:
+            train_df, train_id = pool.map(load_data, files)
+        except IOError as er:
+            print (er)
+        else:
+            print ("Loading done")
+        
+        train_df['DT_M'] = train_df['TransactionDT'].apply(lambda x: (START_DATE + datetime.timedelta(seconds = x)))
+        train_df['DT_M'] = (train_df['DT_M'].dt.year-2017)*12 + train_df['DT_M'].dt.month 
+        test_df = train_df[train_df['DT_M']==train_df['DT_M'].max()].reset_index(drop=True)
+        train_df = train_df[train_df['DT_M']<(train_df['DT_M'].max())].reset_index(drop=True)
+        
+        test_id  = train_id[train_id['TransactionID'].isin(test_df['TransactionID'])].reset_index(drop=True)
+        train_id = train_id[train_id['TransactionID'].isin(train_df['TransactionID'])].reset_index(drop=True)
+        
+        del train_df['DT_M'], test_df['DT_M']
+    
+    
+else:    
+    files=['data/train_transaction.pkl',
+           'data/test_transaction.pkl',
+           'data/train_identity.pkl',
+           'data/test_identity.pkl']
+
+    with multiprocessing.Pool() as pool:
+        print("Loading...")
+        try:
+            train_df, test_df, train_id, test_id = pool.map(load_data, files)
+        except IOError as er:
+            print (er)
+        else:
+            print ("Loading done")
+
+
+# In[14]:
+
+
+train_df['TransactionAmt'] = train_df['TransactionAmt'].clip(upper=5000)
+
+
+# In[15]:
+
+
+train_base_cols = list(train_df)
+test_base_cols = list(test_df)
+
+labels = train_df[TARGET]
+
+train_num = train_df.shape[0]
+test_num = test_df.shape[0]
+
+train_df['TransactionAmt'] = train_df['TransactionAmt'].astype(float)
+test_df['TransactionAmt'] = test_df['TransactionAmt'].astype(float)
+
+
+# In[16]:
+
+
+gc.collect()
+
+
+# In[17]:
+
+
+print('Shape control: ', train_df.shape, test_df.shape, train_id.shape, test_id.shape)
+
+
+# In[18]:
+
+
+train_df.head()
+
+
+# # TransactionDT transformation 
+
+# In[19]:
+
+
+train_df['DT'] = train_df['TransactionDT'].apply(lambda s:(START_DATE + datetime.timedelta(seconds = s)))
+test_df['DT'] = test_df['TransactionDT'].apply(lambda s:(START_DATE + datetime.timedelta(seconds = s)))
+
+for df in [train_df, test_df]:
+    # total count of time periods
+    df['DT_M'] = (df['DT'].dt.year-2017)*12 + df['DT'].dt.month
+    df['DT_W'] = (df['DT'].dt.year-2017)*52 + df['DT'].dt.weekofyear
+    df['DT_D'] = (df['DT'].dt.year-2017)*365 + df['DT'].dt.dayofyear
+    df['DT_H'] = df['DT_D']*24 + df['DT'].dt.hour
+    # datetime
+    df['hour'] = df['DT'].dt.hour
+    df['dayofweek'] = df['DT'].dt.dayofweek
+    df['day'] = df['DT'].dt.day
+    df['month'] = df['DT'].dt.month
+
+
+# # Possible solo features
+
+# In[20]:
+
+
+################### Number of nan
+card_cols = ['card1', 'card2', 'card3', 'card4', 'card5','card6']
+M_cols = ['M1','M2','M3','M5','M6','M7','M8','M9']
+C_cols = ['C1','C2','C3','C4','C5','C6','C7','C8','C9','C10','C11','C12','C13','C14']
+D_cols = ['D{}'.format(i) for i in range(1,16)]
+V1_11_cols = ['V{}'.format(i) for i in range(1,12) ]
+V12_34_cols = ['V{}'.format(i) for i in range(12,35)]
+V35_52_cols = ['V{}'.format(i) for i in range(35,53)]
+V53_74_cols = ['V{}'.format(i) for i in range(53,75)]
+V75_94_cols = ['V{}'.format(i) for i in range(75,95)]
+V95_137_cols = ['V{}'.format(i) for i in range(95,138)]
+V138_166_cols = ['V{}'.format(i) for i in range(138,167)]
+V167_216_cols = ['V{}'.format(i) for i in range(167,217)]
+V217_278_cols = ['V{}'.format(i) for i in range(217,279)]
+V279_321_cols = ['V{}'.format(i) for i in range(279,322)]
+V322_339_cols = ['V{}'.format(i) for i in range(322,340)]
+
+for df in [train_df, test_df]:
+    df['nulls'] = train_df.isnull().sum(axis=1)
+    df['card_na'] = df[card_cols].isna().sum(axis=1).astype(np.int8)
+    df['M_na'] = df[M_cols].isna().sum(axis=1).astype(np.int8)
+    df['C_na'] = df[C_cols].isna().sum(axis=1).astype(np.int8)
+    df['D_na'] = df[D_cols].isna().sum(axis=1).astype(np.int8)
+    df['V1-11_na'] = df[V1_11_cols].isna().sum(axis=1)
+    df['V12-34_na'] = df[V12_34_cols].isna().sum(axis=1)
+    df['V35-52_na'] = df[V35_52_cols].isna().sum(axis=1)
+    df['V53-74_na'] = df[V53_74_cols].isna().sum(axis=1)
+    df['V75-94_na'] = df[V75_94_cols].isna().sum(axis=1)
+    df['V95-137_na'] = df[V95_137_cols].isna().sum(axis=1)
+    df['V138-166_na'] = df[V138_166_cols].isna().sum(axis=1)
+    df['V167-216_na'] = df[V167_216_cols].isna().sum(axis=1)
+    df['V217-278_na'] = df[V217_278_cols].isna().sum(axis=1)
+    df['V279_321_na'] = df[V279_321_cols].isna().sum(axis=1)
+    df['V322_339_na'] = df[V322_339_cols].isna().sum(axis=1)
+
+
+# In[21]:
+
+
+################## Check if the TransactionAmt is common or not
+train_df['TransactionAmt_check'] = np.where(train_df['TransactionAmt'].isin(test_df['TransactionAmt']), 1, 0)
+test_df['TransactionAmt_check']  = np.where(test_df['TransactionAmt'].isin(train_df['TransactionAmt']), 1, 0)
+
+
+# In[22]:
+
+
+################## Decimal part of TransactionAmt
+for df in [train_df, test_df]:
+    df['TransactionAmt_decimal'] = ((df['TransactionAmt'] - df['TransactionAmt'].astype(int)) * 1000).astype(int)
+    # df['TransactionAmt_decimal_length'] = df['TransactionAmt'].astype(str).str.split('.', expand=True)[1].str.len()
+    df['TransactionAmt_has_decimal'] = np.where((df['TransactionAmt'] - df['TransactionAmt'].astype(int))==0,0,1)
+
+
+# In[23]:
+
+
+################# log1p transformation of 'TransactionAmt'
+train_df['TransactionAmt_log1p'] = np.log1p(train_df['TransactionAmt'])
+test_df['TransactionAmt_log1p'] = np.log1p(test_df['TransactionAmt']) 
+
+
+# In[24]:
+
+
+################### whether is December
+for df in [train_df, test_df]:
+    df['isDec']=np.where(df['month']==12,1,0)
+
+
+# In[25]:
+
+
+################### Features from WLN
+train_wln = pd.read_csv('./train_2_features_from_wln.csv')
+test_wln = pd.read_csv('./test_2_features_from_wln.csv')
+
+#train_df['cnt_of_amt_in_fraud'] = train_wln['这笔金额在这个人为1的交易出现次数']
+#test_df['cnt_of_amt_in_fraud'] = test_wln['这笔金额在这个人为1的交易出现次数']
+# train_df['prob_of_fraud_by_D2-DT'] = train_wln['这个人的D2-DT的违约概率']
+# test_df['prob_of_fraud_by_D2-DT'] = test_wln['这个人的D2-DT的违约概率']
+
+
+# # Target mean
+
+# In[26]:
+
+
+#################### ProductCD and M4 Target mean
+for col in ['ProductCD','M4','addr1']:
+    temp_dict = train_df.groupby([col])[TARGET].agg(['mean']).reset_index().rename(columns={'mean': col+'_target_mean'})
+    temp_dict.index = temp_dict[col].values
+    temp_dict = temp_dict[col+'_target_mean'].to_dict()
+
+    train_df[col+'_target_mean'] = train_df[col].map(temp_dict)
+    test_df[col+'_target_mean']  = test_df[col].map(temp_dict)
+
+
+# #  Combination labels of categorical features
+
+# In[27]:
+
+
+################# Create time labels
+for df in [train_df, test_df]:
+    df['D1-DT'] = df['D1'] - df['DT_D']
+    df['D15-DT'] = df['D15'] - df['DT_D']
+    df['D8-DT'] = df['D8'] - df['DT_D']
+
+
+# In[28]:
+
+
+################# Reset values for "noise" in 'card1'(真的需要？如果为了特定用户身份，就不需要将单条的用户聚类)
+"""
+i_cols = ['card1']
+
+for col in i_cols: 
+    valid_card = pd.concat([train_df[[col]], test_df[[col]]])
+    valid_card = valid_card[col].value_counts()
+    valid_card = valid_card[valid_card>2]
+    valid_card = list(valid_card.index)
+
+    train_df[col] = np.where(train_df[col].isin(test_df[col]), train_df[col], np.nan)
+    test_df[col]  = np.where(test_df[col].isin(train_df[col]), test_df[col], np.nan)
+
+    train_df[col] = np.where(train_df[col].isin(valid_card), train_df[col], np.nan)
+    test_df[col]  = np.where(test_df[col].isin(valid_card), test_df[col], np.nan)
+"""
+
+
+# In[29]:
+
+
+######################### Create possible uid (to determine a specific acount or user)
+for df in [train_df, test_df]:
+    # card1,2,3,5
+    df['uid1'] = df['card1'].astype(str)+'_'+df['card2'].astype(str)+'_'+df['card3'].astype(str)    +'_'+df['card5'].astype(str)
+    # card1,2,3,5 + D1-DT
+    df['uid2'] = df['card1'].astype(str)+'_'+df['card2'].astype(str)+'_'+df['card3'].astype(str)    +'_'+df['card5'].astype(str)+'_'+df['D1-DT'].astype(str)
+    # card1,2,3,5 + addr1,2
+    df['uid3'] = df['card1'].astype(str)+'_'+df['card2'].astype(str)+'_'+df['card3'].astype(str)    +'_'+df['card5'].astype(str)+'_'+df['addr1'].astype(str)+'_'+df['addr2'].astype(str)
+    # card1,2,3,5 + addr1,2 + email
+    df['uid4'] = df['card1'].astype(str)+'_'+df['card2'].astype(str)+'_'+df['card3'].astype(str)    +'_'+df['card5'].astype(str)+'_'+df['addr1'].astype(str)+'_'+df['addr2'].astype(str)+'_'+    df['P_emaildomain'].astype(str)
+    # card1,2,3,5 + addr1,2 + D1-DT
+    df['uid5'] = df['card1'].astype(str)+'_'+df['card2'].astype(str)+'_'+df['card3'].astype(str)    +'_'+df['card5'].astype(str)+'_'+df['addr1'].astype(str)+'_'+df['addr2'].astype(str)+'_'+    '_'+df['D1-DT'].astype(str)
+
+
+# # Feautures on TransactionAmt
+
+# In[30]:
+
+
+################### Statistical features of TransactionAmt by cardx and uidx
+main_cols = ['TransactionAmt',]
+cate_cols = ['card1', 'card2', 'card3', 'card5', 'uid1', 'uid2', 'uid3', 'uid4','uid5']
+agg_types = ['mean', 'std', 'median']
+
+train_df, test_df = aggregation(train_df, test_df, main_cols, cate_cols, agg_types, with_diff=False, with_norm=False)
+
+
+# In[31]:
+
+
+################## Statistical features of TransactionAmt by time periods 
+main_cols = ['TransactionAmt']
+cate_cols = ['DT_M', 'DT_W', 'DT_D']
+agg_types = ['mean', 'median', 'std']
+
+
+train_df, test_df = aggregation(train_df, test_df, main_cols, cate_cols, agg_types, with_diff=False, with_norm=True)
+
+
+# In[32]:
+
+
+# Sliding windows: 前3,7,14,30天里的所有交易额的均值，中位数，方差（线下略微提升，线上略微降低, 是否保留暂定）
+"""
+for df in [train_df, test_df]:
+    for offset in ['3d','7d','14d','30d']:
+        rolling_obj = df[['DT','TransactionAmt']].set_index('DT').rolling(offset, min_periods = 1, closed = 'right')
+        df[offset+'_TransAmt_mean'] = rolling_obj.mean().reset_index(drop=True)
+        df[offset+'_TransAmt_median'] = rolling_obj.median().reset_index(drop=True)
+        df[offset+'_TransAmt_std'] = rolling_obj.std().reset_index(drop=True)
+        # df[offset+'_TransAmt_cnt'] = rolling_obj.count().reset_index(drop=True)
+        # df[offset+'_TransAmt_diff_median'] = df['TransactionAmt'] - df[offset+'_TransAmt_median']
+        # df[offset+'_TransAmt_zscore'] = (df['TransactionAmt'] - df[offset+'_TransAmt_mean']) / df[offset+'_TransAmt_std']
+"""
+
+
+# In[33]:
+
+
+"""
+for df in [train_df, test_df]:
+    cnt_by_DT_D = df['DT_D'].value_counts()
+    temp_df = pd.DataFrame(df['DT_D'].unique(), columns=['DT_D'])
+    temp_df['cnt_by_DT_D'] = temp_df['DT_D'].map(cnt_by_DT_D)
+    temp_df = temp_df.set_index('DT_D')
+    
+    for i in [1,3,7]:
+        temp_df['cnt_by_DT_D_delta_shift_{}'.format(i)] = (temp_df['cnt_by_DT_D'].shift(i) - temp_df['cnt_by_DT_D'])/temp_df['cnt_by_DT_D']
+        temp_df['cnt_by_DT_D_delta_shift_{}'.format(i)].fillna(-1, inplace=True)
+        df['cnt_by_DT_D_delta_shift_{}'.format(i)] = df['DT_D'].map(temp_df['cnt_by_DT_D_delta_shift_{}'.format(i)])
+"""
+
+
+# In[34]:
+
+
+# train_df, test_df = add_grouped_time_delta_features(train_df, test_df, 'DT', 'TransactionAmt', 'uid5', [-1,1])
+
+
+# In[35]:
+
+
+gc.collect()
+
+
+# # Features on addr
+
+# In[36]:
+
+
+# TFIDF encoding of addr1
+target_col = 'addr1'
+refer_col = 'DT_D'
+
+train_df[target_col] = train_df[target_col].fillna(999).astype(int).astype(str)
+test_df[target_col] = test_df[target_col].fillna(999).astype(int).astype(str)
+train_df, test_df = tfidf_encoding(train_df, test_df, target_col, refer_col)
+
+
+# # Features on D cols
+
+# In[37]:
+
+
+D_cols = ['D'+str(i) for i in range(1,16)]
+
+# some solo features derived from D
+for df in [train_df, test_df]:
+    # D9: hour in a day
+    df['D8_D9_decimal_dist'] = df['D8'].fillna(0)-df['D8'].fillna(0).astype(int)
+    df['D8_D9_decimal_dist'] = ((df['D8_D9_decimal_dist']-df['D9'])**2)**0.5
+    df['D8'] = df['D8'].fillna(-1).astype(int)
+    
+    df['D8>D1'] = np.where(df['D8']>df['D1'],1,0)
+    
+    df['D1_is_0'] = np.where(df['D1']==0,1,0)
+    df['D3_is_0'] = np.where(df['D3']==0,1,0)
+    
+    df['D1_rt_in_uid5'] = df.groupby('uid5')['D1'].apply(lambda s: ((s-s.min())/(s.max()-s.min())))
+##################### Normalization on cumulative attributes
+# （略有上升）
+periods = ['DT_D']
+D_cols.remove('D9')
+D_cols.remove('D3')
+
+for df in [train_df, test_df]:
+    df = values_normalization(df, periods, D_cols)
+
+##################### Statistical features of D3（略有上升）
+main_cols = ['D3']
+cate_cols = ['uid1', 'uid2', 'uid3', 'uid4','uid5']
+agg_types = ['mean', 'median', 'std']
+
+train_df, test_df = aggregation(train_df, test_df, main_cols, cate_cols, agg_types, with_diff=False, with_norm=False)
+
+
+# # Features on M cols
+
+# In[38]:
+
+
+#################### sum of T/F, sum of T, sum of F, and sum of nan
+for df in [train_df, test_df]:
+    df['M_sum_T'] = (df[M_cols]=='T').sum(axis=1).astype(np.int8)
+    df['M_sum_F'] = (df[M_cols]=='F').sum(axis=1).astype(np.int8)
+    df['M_sum'] = df['M_sum_F'] + df['M_sum_T']
+    
+
+
+# # Statistical features on C cols
+
+# In[39]:
+
+
+main_cols = ['C1','C2','C3','C4','C5','C6','C7','C8','C9','C10','C11','C12','C13','C14']
+cate_cols = ['uid1', 'uid2', 'uid3', 'uid4', 'uid5']
+agg_types = ['mean', 'std']
+
+train_df, test_df = aggregation(train_df, test_df, main_cols, cate_cols, agg_types, with_diff=False, with_norm=False)
+
+
+# main_cols = ['C13', 'C14', 'C1','C2']
+# cate_cols = ['DT_M', 'DT_W', 'DT_D']
+# agg_types = ['mean', 'median', 'std']
+# 
+# train_df, test_df = aggregation(train_df, test_df, main_cols, cate_cols, agg_types, with_diff=False, with_norm=False)
+
+# # Statistical features on TransactionPerDay
+
+# In[40]:
+
+
+# （略有下降）
+for df in [train_df, test_df]:
+    df['TransactionAmtPerDay'] = df['TransactionAmt']/(df['D3']+1)
+
+
+# In[41]:
+
+
+# （有所上升）
+main_cols = ['TransactionAmtPerDay']
+cate_cols = ['uid1','uid2','uid3','uid4','uid5']
+agg_types = ['mean', 'median', 'std']
+
+train_df, test_df = aggregation(train_df, test_df, main_cols, cate_cols, agg_types, with_diff=False, with_norm=False)
+
+
+# In[42]:
+
+
+del train_df['TransactionAmtPerDay'], test_df['TransactionAmtPerDay']
+
+
+# #  ProductType
+
+# In[43]:
+
+
+# create bins
+train_df['TransactionAmtBin'] = (train_df['TransactionAmt']/10).astype(int)
+test_df['TransactionAmtBin'] = (test_df['TransactionAmt']/10).astype(int)
+# create product_type on ProductCDxTransactionAmtBin
+train_df['product_type'] = train_df['ProductCD'].astype(str)+'_'+train_df['TransactionAmtBin'].astype(str)
+test_df['product_type'] = test_df['ProductCD'].astype(str)+'_'+test_df['TransactionAmtBin'].astype(str)
+
+
+# # Email features
+
+# In[44]:
+
+
+email_dict = {
+ 'aim': "aol",
+ 'anonymous': "anon",
+ 'aol': "aol",
+ 'att': "att",
+ 'bellsouth': "other",
+ 'cableone': "other",
+ 'centurylink': "centurylink",
+ 'cfl': "other",
+ 'charter': "spectrum",
+ 'comcast': "comcast",
+ 'cox': "other",
+ 'earthlink': "other",
+ 'email_not_provided': 'email_not_provided',
+ 'embarqmail': "centurylink",
+ 'frontier': "yahoo",
+ 'frontiernet': "yahoo",
+ 'gmail': "google",
+ 'gmx': "other",
+ 'hotmail': "msft",
+ 'icloud': "apple",
+ 'juno': "other",
+ 'live': "msft",
+ 'mac': "apple",
+ 'mail': "other",
+ 'me': "apple",
+ 'msn': "msft",
+ 'netzero': "other",
+ 'optonline': "other",
+ 'outlook': "msft",
+ 'prodigy': "att",
+ 'protonmail': "proton",
+ 'ptd': "other",
+ 'q': "centurylink",
+ 'roadrunner': "other",
+ 'rocketmail': "yahoo",
+ 'sbcglobal': "att",
+ 'sc': "other",
+ 'scranton': "other",
+ 'servicios-ta': "other",
+ 'suddenlink': "other",
+ 'twc': "spectrum",
+ 'verizon': "other",
+ 'web': "other",
+ 'windstream': "other",
+ 'yahoo': "yahoo",
+ 'ymail': "yahoo"
+}
+
+
+# In[45]:
+
+
+for df in [train_df, test_df]:
+    df['P_emaildomain'] = df['P_emaildomain'].fillna('email_not_provided')
+    df['R_emaildomain'] = df['R_emaildomain'].fillna('email_not_provided')
+    
+    df['email_check'] = np.where((df['P_emaildomain']==df['R_emaildomain'])&(df['P_emaildomain']!='email_not_provided'),1,0)
+    
+    df['P_emaildomain_prefix'] = df['P_emaildomain'].apply(lambda s: s.split('.')[0])
+    df['R_emaildomain_prefix'] = df['R_emaildomain'].apply(lambda s: s.split('.')[0])
+    # 线下测试下降，但我感觉为了提高稳定性有必要，待定
+    # df['P_emaildomain_bin'] = df['P_emaildomain_prefix'].map(email_dict)
+    # df['R_emaildomain_bin'] = df['R_emaildomain_prefix'].map(email_dict)
+
+
+# # Device
+
+# In[46]:
+
+
+train_id.head()
+
+
+# In[47]:
+
+
+for df in [train_id, test_id]:
+    # df['DeviceInfo'] = df['DeviceInfo'].fillna('unknown_device').str.lower()
+    # df['DeviceInfo_device'] = df['DeviceInfo'].apply(lambda x: ''.join([i for i in x if i.isalpha()]))
+    # df['DeviceInfo_device'] = df['DeviceInfo'].apply(lambda x: ''.join([i for i in x if i.isnumeric() or i=='.']))
+    
+    # id_30: OS
+    df['id_30'] = df['id_30'].apply(lambda s : s.replace('_','.') if type(s)=='string' else s).fillna('unknown_os').str.lower()
+    temp_OS_list = df['id_30'].apply(lambda s:s.replace('mac os x','mac').split())
+    df['id_30_OS'] = temp_OS_list.apply(lambda s:s[0])
+    df['id_30_version'] = temp_OS_list.apply(lambda s : '-1' if len(s)==1 else s[1])
+    # df['id_30_version'] = temp_OS_list.apply(lambda s : ['-1'] if len(s)==1 else s[1].split('.'))
+    # df['id_30_version1'] = df['id_30_version'].apply(lambda s : s[0])
+    # df['id_30_version2'] = df['id_30_version'].apply(lambda s : s[1] if len(s)>1 else '-1')
+    # df['id_30_version3'] = df['id_30_version'].apply(lambda s : s[2] if len(s)>2 else '-1')
+    del temp_OS_list
+    
+    # id_31: browser
+    df['id_31'] = df['id_31'].fillna('unknown_browser').str.lower()
+    temp_browser_list = df['id_31'].replace('mobile safari','mobile_safari').replace('firefox mobile','firefox_mobile').                                replace(['samsung/sm-g531h','samsung/sm-g532m'],'samsung_old').map(lambda s: s.split())
+    df['id_31_browser'] = df['id_31'].apply(lambda s: ''.join([i for i in s if i.isalpha()]))
+    df['id_31_version'] = df['id_31'].apply(lambda s: ''.join([i for i in s if i.isnumeric() or i=='.'])).apply(lambda s : s)
+    #df['id_31_version'] = df['id_31'].apply(lambda s: ''.join([i for i in s if i.isnumeric() or i=='.'])).apply(lambda s : s.split('.'))
+    #df['id_31_version1'] = df['id_31_version'].apply(lambda s : s[0] if s[0] else '-1')
+    #df['id_31_version2'] = df['id_31_version'].apply(lambda s : s[1] if len(s)>1 else '-1')
+    del temp_browser_list
+    
+    # id_33:resolution
+    df['id_33'].fillna('0', inplace =True)
+    temp_res = df['id_33'].apply(lambda s : s.split('x'))
+    df['ResVer'] = temp_res.apply(lambda s : 0 if s[0]=='0' else int(s[0])).astype('int16') # Vertical
+    df['ResHor'] = temp_res.apply(lambda s : 0 if s[0]=='0' else int(s[1])).astype('int16') # Horizontal
+    
+    # DeviceInfo
+    df['DeviceInfo_isna'] = np.where(df['DeviceInfo'].isna(), 1, 0)
+
+
+# In[48]:
+
+
+gc.collect()
+
+
+# # Concatenate df and id
+
+# In[49]:
+
+
+temp_df = train_df[['TransactionID']]
+temp_df = temp_df.merge(train_id, on='TransactionID', how='left')
+del temp_df['TransactionID']
+train_df = pd.concat([train_df,temp_df], axis=1)
+    
+temp_df = test_df[['TransactionID']]
+temp_df = temp_df.merge(test_id, on='TransactionID', how='left')
+del temp_df['TransactionID']
+test_df = pd.concat([test_df,temp_df], axis=1)
+
+
+# # Frequency features
+
+# In[50]:
+
+
+i_cols = ['card1','card2','card3','card4','card5','card6',
+          'C13',
+          'D3',
+          'addr1','addr2',
+          'dist1', 'dist2',
+          'P_emaildomain', 'R_emaildomain',
+          'id_02',
+          'id_30','id_30_OS', 'id_30_version',
+          'id_31', 'id_31_browser', 'id_31_version',
+          'id_33',
+          'DeviceInfo',
+          'uid1', 'uid2', 'uid3', 'uid4','uid5',
+          'product_type',
+         ]
+
+
+# In[51]:
+
+
+for col in i_cols:
+    temp_df = pd.concat([train_df[[col]], test_df[[col]]])
+    fq_encode = temp_df[col].value_counts(dropna=False).to_dict()   
+    train_df[col+'_fq_enc'] = train_df[col].map(fq_encode)
+    test_df[col+'_fq_enc']  = test_df[col].map(fq_encode)
+
+
+# In[52]:
+
+
+########################## The ratio of counts in time perios(TODO: 增加类别)
+for col in ['DT_M','DT_W','DT_D']:
+    temp_df = pd.concat([train_df[[col]], test_df[[col]]])
+    fq_encode = temp_df[col].value_counts().to_dict()
+            
+    train_df[col+'_total'] = train_df[col].map(fq_encode)
+    test_df[col+'_total']  = test_df[col].map(fq_encode)
+
+
+i_cols = ['uid3','uid4','uid5', 'product_type','addr1']
+periods = ['DT_M','DT_W','DT_D']
+
+for period in periods:
+    for col in i_cols:
+        new_column = col + '_rt_in_' + period
+            
+        temp_df = pd.concat([train_df[[col,period]], test_df[[col,period]]])
+        temp_df[new_column] = temp_df[col].astype(str) + '_' + (temp_df[period]).astype(str)
+        fq_encode = temp_df[new_column].value_counts().to_dict()
+            
+        train_df[new_column] = (train_df[col].astype(str) + '_' + train_df[period].astype(str)).map(fq_encode)
+        test_df[new_column]  = (test_df[col].astype(str) + '_' + test_df[period].astype(str)).map(fq_encode)
+        
+        train_df[new_column] = train_df[new_column]/train_df[period+'_total']
+        test_df[new_column]  = test_df[new_column]/test_df[period+'_total']
+
+
+# In[53]:
+
+
+gc.collect()
+
+
+# In[54]:
+
+
+train_df.shape, test_df.shape
+
+
+# # PCA for V
+
+# In[55]:
+
+
+rm_V_cols = []
+
+
+# In[56]:
+
+
+# 11 parts
+parts = []
+parts.append(['V{}'.format(i) for i in range(1,12) if 'V{}'.format(i) not in rm_V_cols])
+parts.append(['V{}'.format(i) for i in range(12,35) if 'V{}'.format(i) not in rm_V_cols])
+parts.append(['V{}'.format(i) for i in range(35,53) if 'V{}'.format(i) not in rm_V_cols])
+parts.append(['V{}'.format(i) for i in range(53,75) if 'V{}'.format(i) not in rm_V_cols])
+parts.append(['V{}'.format(i) for i in range(75,95) if 'V{}'.format(i) not in rm_V_cols])
+parts.append(['V{}'.format(i) for i in range(95,138) if 'V{}'.format(i) not in rm_V_cols])
+parts.append(['V{}'.format(i) for i in range(138,167) if 'V{}'.format(i) not in rm_V_cols])
+parts.append(['V{}'.format(i) for i in range(167,217) if 'V{}'.format(i) not in rm_V_cols])
+parts.append(['V{}'.format(i) for i in range(217,279) if 'V{}'.format(i) not in rm_V_cols])
+parts.append(['V{}'.format(i) for i in range(279,322) if 'V{}'.format(i) not in rm_V_cols])
+parts.append(['V{}'.format(i) for i in range(322,340) if 'V{}'.format(i) not in rm_V_cols])
+
+
+# In[57]:
+
+
+for i, part in enumerate(parts):
+    temp_df = pd.concat([train_df[part], test_df[part]]).fillna(-1)
+    pca = PCA(n_components = 3)
+    pca.fit(temp_df)
+    v_pca = pca.transform(temp_df)
+    train_df = pd.concat([train_df, pd.DataFrame(v_pca[:train_num], columns=['V_part{}'.format(i)+'_0', 'V_part{}'.format(i)+'_1', 'V_part{}'.format(i)+'_2'])],axis=1)
+    test_df = pd.concat([test_df, pd.DataFrame(v_pca[train_num:],columns=['V_part{}'.format(i)+'_0', 'V_part{}'.format(i)+'_1', 'V_part{}'.format(i)+'_2'])],axis=1)
+
+
+# In[58]:
+
+
+test_df.shape
+
+
+# ## Removing list
+
+# In[59]:
+
+
+rm_cols = [
+    'TransactionID', 'TransactionAmt', 'TransactionDT','TransactionAmt_decimal',
+    'card1', 'card2',
+    'uid1', 'uid2', 'uid3', 'uid4','uid5',
+    'addr1',
+    'day', 'month', 'hour', 'dayofweek',
+    'DT', 'DT_M', 'DT_W', 'DT_D', 'DT_H',
+    'DT_D_total', 'DT_W_total', 'DT_M_total',
+    'id_30','id_31','id_33',
+    'DeviceInfo',
+    'isFraud',
+    'product_type',
+    'TransactionAmtBin',
+    'D15-DT','D1-DT','D2-DT'
+]
+
+
+# In[60]:
+
+
+################### Remove original V columns
+rm_cols += ['V{}'.format(i) for i in range(0,340) if 'V{}'.format(i) not in rm_cols]
+
+
+# ################### Remove columns with too many null values
+# a = train_df.loc[:, train_df.isnull().sum(axis=0)/train_num > 0.95].keys()
+# b = test_df.loc[:, test_df.isnull().sum(axis=0)/test_num > 0.95].keys()
+# 
+# rm_cols = rm_cols + list(a) + list(b)
+
+# In[61]:
+
+
+feature_cols = [col for col in train_df.keys() if col not in rm_cols]
+print(feature_cols)
+
+
+# # All the category features
+
+# In[62]:
+
+
+# M1-M9
+tran_cols = []
+for i in range(1,10):
+    if 'M{}'.format(i) in feature_cols:
+        tran_cols.append('M{}'.format(i))
+        
+# id_12-id_38
+id_cols = []
+for i in range(12,39):
+    if 'id_{}'.format(i) in feature_cols:
+        id_cols.append('id_{}'.format(i))
+        
+#for col in id_cols:
+#    if train_df[col].nunique() > 300:
+#        print(col+": ",train_df[col].nunique())
+#        id_cols.remove(col)
+
+cate_cols = ['card3', 'card5', 'card4', 'card6', 'addr1', 'addr2', 'ProductCD', 'P_emaildomain', 'R_emaildomain', 'R_emaildomain_prefix', 
+             'P_emaildomain_prefix', *tran_cols, *id_cols, 'id_30_OS', 
+             'id_31_browser', 'id_30_version', 'id_31_version', 'DeviceType']
+
+print('Categorical columns: ', cate_cols )
+
+
+# In[63]:
+
+
+# Fillna and label encoding
+for col in cate_cols:
+    #print(col)
+    train_df[col].fillna('unknown', inplace=True)
+    test_df[col].fillna('unknown', inplace=True)
+    
+    train_df[col] = train_df[col].astype(str)
+    test_df[col] = test_df[col].astype(str)
+    
+    le = LabelEncoder()
+    le.fit(list(train_df[col])+list(test_df[col]))
+    train_df[col] = le.transform(train_df[col])
+    test_df[col] = le.transform(test_df[col])
+    
+    train_df[col] = train_df[col].astype('category')
+    test_df[col] = test_df[col].astype('category')
+
+
+# In[64]:
+
+
+gc.collect()
+
+
+# In[65]:
+
+
+## ks test
+if KS_TEST:
+    feature_cols = set(feature_cols).difference(train_base_cols+rm_cols)
+    list_p_value =[]
+
+    for i in tqdm(feature_cols):
+        list_p_value.append(ks_2samp(test_df[i] , train_df[i])[1])
+
+    Se = pd.Series(list_p_value, index = feature_cols).sort_values() 
+    list_discarded = list(Se[Se==0].index)
+
+    print(list_discarded)
+
+    feature_cols = [col for col in train_df.keys() if col not in rm_cols + list_discarded]
+    cate_cols = [col for col in cate_cols if col not in rm_cols + list_discarded]
+
+
+# # Training
+
+# In[66]:
+
+
+if NEG_SAMPLE:
+    # Negative downsampling
+    train_pos = train_df[train_df['isFraud']==1]
+    train_neg = train_df[train_df['isFraud']==0]
+
+    train_neg = train_neg.sample(int(train_df.shape[0] * 0.2), random_state=SEED)
+    train_df = pd.concat([train_pos,train_neg]).sort_index().reset_index(drop=True)
+
+    labels = train_df[TARGET]
+    
+    train_num = train_df.shape[0]
+
+
+# In[67]:
+
+
+print(train_df.shape, test_df.shape)
+
+
+# In[68]:
+
+
+lgb_param = {
+    'boosting': 'gbdt',
+    'objective': 'binary',
+    'n_estimators': 10000,
+    'learning_rate': 0.01,
+    'num_leaves': 2**8,
+    'num_threads': -1,
+    'seed': SEED,
+    'max_depth': -1,
+    'bagging_fraction': 0.7,
+    'bagging_freq': 1,
+    'feature_fraction': 0.7,
+    'early_stopping_round': 100,
+    'metric': 'auc'
+}
+'''
+    'min_data_in_leaf': 5,
+    'min_sum_hessian_in_leaf': 4,
+    'lambda_l1': 3,
+    'lambda_l2': 5,
+'''
+
+
+# In[69]:
+
+
+if LOCAL_TEST:
+    lgb_param['learning_rate'] = 0.01
+    lgb_param['n_estimators'] = 20000
+    lgb_param['early_stopping_rounds'] = 100
+    test_predictions, oof_pred_prob = make_predictions_kf(train_df, test_df, feature_cols,cate_cols, labels, lgb_param)
+else:
+    lgb_param['learning_rate'] = 0.005
+    lgb_param['n_estimators'] = 1800
+    lgb_param['early_stopping_rounds'] = 100
+    # test_predictions = make_predictions_gkf(train_df, test_df, feature_cols, labels, lgb_param, NFOLDS=6)
+    test_predictions, oof_pred_prob = make_predictions_kf(train_df, test_df, feature_cols, cate_cols, labels, lgb_param, NFOLDS=10)
+    test_predictions.to_csv(f"./sub/sub_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_.csv", index=False)
+    oof_df = train_df[['TransactionID']]
+    ood_df['isFraud'] = oof_pred_prob
+    oof_df.to_csv(f"./oof/oof_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_.csv", index=False)
+
+
+# In[ ]:
+
+
+
+
